@@ -67,7 +67,7 @@
 }
 
 /* This struct contains all the shared informations that must be filled in
-* every time a reader finishes to encrypt a (file) portion chunk.
+* every time a reader finishes to encrypt/decrypt a (file) portion chunk.
 * Only one file chunk at a time will be stored inside this structure and 
 * written to the output file by the writer thread.  */
 typedef struct {
@@ -78,7 +78,7 @@ typedef struct {
     size_t chunksize;
     size_t offset; /* offset of the current chunk */
     unsigned char *chunk;
-    unsigned char *key;
+    unsigned char *key; /* derived key from password */
     unsigned char *iv;
     unsigned int turn; /* reader thread index inside array */
     unsigned int readers_n; /* total reader threads */
@@ -97,7 +97,7 @@ typedef struct {
     size_t chunksizeRem; /* remaining bytes from division among reader(s)  */
     size_t firstThreadRem; /* remaining bytes read only by the first reader */
     char *filepath;
-    // shared with writer
+    // shared
     shared_data *s;   
 } reader_data;
 
@@ -139,8 +139,10 @@ void cond_signal(pthread_cond_t *cond) {
         exit_with_err("pthread_cond_signal", err);
 }
 
-/* Derive `key` and `IV` from `password` using PBKDF2 and a previously randomly generated
- * `salt` or the previously used salt to encrypt the file that now must be decrypted. */
+/* Derive a `key` for ciphering operations from user `password`,`salt` and `iv` using PBKDF2.
+ * NOTE: The salt parameter must be previously randomly generated or the previously
+ * used value to encrypt the file that now must be decrypted; the iv must be managed like
+ * the salt except that it is automatically generated if a previous value is not passed. */
 void derive_key_iv(const char *passw, unsigned char *salt, unsigned char *key, unsigned char *iv) {
     unsigned char key_iv[KEY_LEN + IV_LEN];
 
@@ -153,7 +155,31 @@ void derive_key_iv(const char *passw, unsigned char *salt, unsigned char *key, u
     memcpy(iv, key_iv + KEY_LEN, IV_LEN);
 }
 
-/* Reader thread function. */
+
+/* Reader thread function.
+ * Each reader thread reads a file chunk at time for every portion the file has been split.
+ * A file chunk contains `chunksize` bytes and only in the first file portion a reader might also
+ * read `chunksizeRem` bytes as reminder after total file size division among all the others.
+ * Only the first reader thread might also read extra `firstThreadRem` bytes.
+ * These two bytes reminders are required in order to process the input file dividing it in portions,
+ * each one split in chunks (as many as the number of readers).
+ * This approach helps avoid the need to load the entire file into memory at once, making it 
+ * possible to process large files (e.g., an 1GB file) without requiring 1GB of free RAM.
+ * 
+ * Example with a 4-core CPU (3 readers, 1 writer) and a 100MB file:
+ * +-----------------------------------------------------------------------------------------------------------+
+ * |                                                    FILE (100MB Total)                                     |        
+ * |  +----------------------------------------------------------+------------------------------------------+  |                         
+ * |  |      Portion 1 (48MB + 4MB)                              |          Portion 2 (48MB)                |  |        
+ * |  |  +---------------------+--------------+--------------+       +------------+----------+----------+   |  |                 
+ * |  |  |   Chunk 1           |    Chunk 2   |   Chunk 3    |       |  Chunk 1   | Chunk 2  | Chunk 3  |   |  |
+ * |  |  | (16MB + 1MB + 1MB)  | (16MB + 1MB) | (16MB + 1MB) |       |  (16MB)    | (16MB)   | (16MB)   |   |  |
+ * |  |  +---------------------+--------------+--------------+       +------------+----------+----------+   |  |
+ * |  +---------------------------------------------------+-------------------------------------------------+  |
+ * +-----------------------------------------------------------------------------------------------------------+
+ * chunksizeRem = 1MB; firstThreadRem = 1MB 
+ * (16MB*3)*2) + (1MB*3) + 1MB = 100MB
+ */
 void *reader_fn(void *arg) {
     reader_data *data = (reader_data *)arg;
     int fd;
@@ -340,12 +366,10 @@ void *writer_fn(void *arg) {
         if(data->s->chunksize > 0) {
             if(write(fd, data->s->chunk, data->s->chunksize) == -1)
                 exit_with_sys_err("writer chunk");
-            printf("WRITER %ld bytes written\n", data->s->chunksize);
             sum += data->s->chunksize;
         }
         /* All readers exited. End of work. */
         if(data->s->readers_exited == data->s->readers_n) {
-            printf("WRITER total %ld bytes written\n", sum);
             EVP_CIPHER_CTX_free(data->s->ctx);
             break;
         }
@@ -356,8 +380,8 @@ void *writer_fn(void *arg) {
 
         // Print loading percentage
         if(data->filesize > 0) {
-            // printf("\rEncrypting... %d%%", (int)((sum*100)/data->filesize));
-            // fflush(stdout); // Flush the output buffer
+            printf("\r%s... %d%%",(data->s->dflag) ? "Decrypting" : "Encrypting", (int)((sum*100)/data->filesize));
+            fflush(stdout); // Flush the output buffer
         }
     }
     mutex_unlock(&data->s->mutex);
@@ -403,7 +427,6 @@ int main(int argc, char *argv[]) {
         if (read(inputf, salt, SALT_LEN) != SALT_LEN || read(inputf, iv, IV_LEN) != IV_LEN)
             exit_with_sys_err("cannot read input file header");
         close(inputf);
-        printf("SALT: %s\nIV: %s\n", salt, iv);
         /* Ignore header length from total file size before chunk split. */
         ifsize -= HEADER_OFFSET;
     }
@@ -411,13 +434,10 @@ int main(int argc, char *argv[]) {
         /* Generate random salt for deriving the key. */
         if (!RAND_bytes(salt, SALT_LEN))
             exit_with_sys_err("RAND_bytes (salt)");
-        printf("Generated SALT: %s\n", salt);
     }
 
     /* Derive AES key from input password. */
-    printf("Password: %s\n", argv[input_file_i+2]);
     derive_key_iv(argv[input_file_i+2], salt, key, iv);
-    printf("Derived key from passw: %s\n", key);
     if(dflag == false) {
         /* Write salt and IV to output cipher file header for future decryption. */
         int outputf = open(argv[input_file_i+1], O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR|S_IWUSR);
