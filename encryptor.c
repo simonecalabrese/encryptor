@@ -34,20 +34,36 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <openssl/evp.h>
+#include <openssl/aes.h>
+#include <openssl/rand.h>
+#include <time.h>
 
 /* Maximum file chunk size processable by . */
 #define MAX_READER_CHUNK_SIZE 1024*1024*16
 /* Minimum file size to enable multithread execution. */
 #define MIN_FILE_SIZE (1024*16) + 1
 
+#define SALT_LEN 16 /* required to derive the key from a password. */
+#define KEY_LEN 32 /* AES key fixed-length of 256 bit. */
+#define IV_LEN 16 /* inizialization vector length. */
+#define HEADER_OFFSET SALT_LEN+IV_LEN
+/* More info at: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html */
+#define PBKDF2_ITERATIONS 100000
+
 #define exit_with_sys_err(err) {    \
     perror(err);                    \
     exit(EXIT_FAILURE);             \
 }
 
-#define exit_with_err(str, err) {                   \
-    fprintf(stderr, "%s: %s", str, strerror(err));  \
-    exit(EXIT_FAILURE);                             \
+#define exit_with_err(str, err) {                       \
+    fprintf(stderr, "%s: %s\n", str, strerror(err));    \
+    exit(EXIT_FAILURE);                                 \
+}
+
+#define exit_with_err_msg(str) {    \
+    fprintf(stderr, "%s\n", str);   \
+    exit(EXIT_FAILURE);             \
 }
 
 /* This struct contains all the shared informations that must be filled in
@@ -61,12 +77,16 @@ typedef struct {
     /* size of the file chunk to write (varies between processed file portions). */
     size_t chunksize;
     size_t offset; /* offset of the current chunk */
-    char *chunk;
+    unsigned char *chunk;
+    unsigned char *key;
+    unsigned char *iv;
     unsigned int turn; /* reader thread index inside array */
     unsigned int readers_n; /* total reader threads */
     unsigned int readers_exited; /* reader threads terminated */
     bool written; /* writer work flag */
     bool fetched; /* reader work flag */
+    bool dflag; /* decryption flag */
+    EVP_CIPHER_CTX *ctx;
 } shared_data;
 
 typedef struct {
@@ -77,14 +97,14 @@ typedef struct {
     size_t chunksizeRem; /* remaining bytes from division among reader(s)  */
     size_t firstThreadRem; /* remaining bytes read only by the first reader */
     char *filepath;
-    // shared
-    shared_data *s;    
+    // shared with writer
+    shared_data *s;   
 } reader_data;
 
 typedef struct {
     pthread_t tid;
     char *filepath;
-    size_t filesize;
+    off_t filesize;
     // shared
     shared_data *s;
 } writer_data;
@@ -119,6 +139,20 @@ void cond_signal(pthread_cond_t *cond) {
         exit_with_err("pthread_cond_signal", err);
 }
 
+/* Derive `key` and `IV` from `password` using PBKDF2 and a previously randomly generated
+ * `salt` or the previously used salt to encrypt the file that now must be decrypted. */
+void derive_key_iv(const char *passw, unsigned char *salt, unsigned char *key, unsigned char *iv) {
+    unsigned char key_iv[KEY_LEN + IV_LEN];
+
+    if (!PKCS5_PBKDF2_HMAC(passw, strlen(passw), salt, SALT_LEN, PBKDF2_ITERATIONS, EVP_sha256(), sizeof(key_iv), key_iv)) {
+        fprintf(stderr, "PBKDF2 failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    memcpy(key, key_iv, KEY_LEN);
+    memcpy(iv, key_iv + KEY_LEN, IV_LEN);
+}
+
 /* Reader thread function. */
 void *reader_fn(void *arg) {
     reader_data *data = (reader_data *)arg;
@@ -129,19 +163,24 @@ void *reader_fn(void *arg) {
      * for every file portion, reader with id 1 (if exists) reads the second chunk
      * inside each portion and so on. */
     for(unsigned int i = 0; i < data->portions_n; i++) {
-        char *c; /* chunk */
+        unsigned char *c; /* chunk to encrypt/decrypt */
         size_t csize; /* chunk size*/
         if(i == 0)
             csize = data->chunksize+data->chunksizeRem;
         else
             csize = data->chunksize;
         
-        if((c = malloc(sizeof(char)*csize)) == NULL)
+        if((c = malloc(sizeof(unsigned char)*csize)) == NULL)
             exit_with_sys_err("reader chunk malloc");
         
         size_t portionStartIndex = (csize*data->s->readers_n*i);
         if(i > 0) portionStartIndex += (data->chunksizeRem*data->s->readers_n);
         size_t offset = (portionStartIndex + (csize*data->id));
+
+        if(data->s->dflag == true) {
+            /* Add input (cipher) header offset before reading encrypted file chunk. */
+            offset += HEADER_OFFSET;
+        }
         
         if(lseek(fd, offset, SEEK_SET) == -1)
             exit_with_sys_err("reader lseek");
@@ -150,16 +189,47 @@ void *reader_fn(void *arg) {
         if(read(fd, c, csize) == -1)
             exit_with_sys_err("reader read");
 
+        /* Buffer for encryption/decryption result. */
+        unsigned char *buf;
+        if((buf = malloc(sizeof(unsigned char)*(csize+EVP_MAX_BLOCK_LENGTH))) == NULL)
+            exit_with_sys_err("reader buf malloc");
+        int bytes = 0; /* bytes encrypted/decrypted. */
+
         mutex_lock(&data->s->mutex);
 
-        /* Wait for its turn. */
+        /* Wait for its turn to send chunk to writer. */
         while(data->s->turn != data->id)
             cond_wait(&data->s->readers[data->id], &data->s->mutex);
-        if((data->s->chunk = realloc(data->s->chunk, sizeof(char)*csize)) == NULL)
-            exit_with_sys_err("reader realloc shared chunk");
-        memcpy(data->s->chunk, c, csize);
+
+        if(data->s->dflag == false) {
+            if (EVP_EncryptUpdate(data->s->ctx, buf, &bytes, c, (int)csize) != 1) {
+                fprintf(stderr, "EVP_EncryptUpdate failed\n");
+                EVP_CIPHER_CTX_free(data->s->ctx);
+                exit(EXIT_FAILURE);
+            }
+        } else {
+            if (EVP_DecryptUpdate(data->s->ctx, buf, &bytes, c, (int)csize) != 1) {
+                fprintf(stderr, "EVP_DecryptUpdate failed\n");
+                EVP_CIPHER_CTX_free(data->s->ctx);
+                exit(EXIT_FAILURE);
+            }
+        }
+        if(bytes == 0) exit_with_sys_err("BYTES0");
+
         free(c);
-        data->s->chunksize = csize;
+        
+        if((data->s->chunk = realloc(data->s->chunk, sizeof(unsigned char)*bytes)) == NULL)
+            exit_with_sys_err("reader realloc shared chunk");
+        memcpy(data->s->chunk, buf, bytes);
+        free(buf);
+        data->s->chunksize = bytes;
+        if(data->s->dflag == true) {
+            /* Remove input (cipher) header offset before writing decrypted file chunk. */
+            offset -= HEADER_OFFSET;
+        } else {
+            /* Add input (cipher) header offset before writing encrypted file chunk. */
+            offset += HEADER_OFFSET;
+        }
         data->s->offset = offset;
         data->s->fetched = true;
         /* Wake writer */
@@ -187,20 +257,53 @@ void *reader_fn(void *arg) {
         data->s->turn = data->s->readers_n-1;
         /* Start of last portion where the remaining bytes must be written. */
         size_t offset = (data->chunksize*data->s->readers_n*data->portions_n)+(data->chunksizeRem*data->s->readers_n);
+        if(data->s->dflag == true)
+            offset += HEADER_OFFSET;
+
         if(lseek(fd, offset, SEEK_SET) == -1)
             exit_with_sys_err("reader final lseek");
 
-        if((data->s->chunk = realloc(data->s->chunk, sizeof(char)*data->firstThreadRem)) == NULL)
+        if((data->s->chunk = realloc(data->s->chunk, sizeof(unsigned char)*data->firstThreadRem)) == NULL)
             exit_with_sys_err("reader realloc shared chunk");
+
         /* Read chunk from file. */
         if(read(fd, data->s->chunk, data->firstThreadRem) == -1)
             exit_with_sys_err("reader read");
 
-        data->s->chunksize = data->firstThreadRem;
+        unsigned char *buf;
+        if((buf = malloc(sizeof(unsigned char)*(data->firstThreadRem+EVP_MAX_BLOCK_LENGTH))) == NULL)
+            exit_with_sys_err("reader buf malloc");
+        int bytes = 0; /* bytes encrypted/decrypted. */
+    
+        if(data->s->dflag == false) {
+            if (EVP_EncryptUpdate(data->s->ctx, buf, &bytes, data->s->chunk, (int)data->firstThreadRem) != 1) {
+                fprintf(stderr, "EVP_EncryptUpdate failed\n");
+                EVP_CIPHER_CTX_free(data->s->ctx);
+                exit(EXIT_FAILURE);
+            }
+        } else {
+            if (EVP_DecryptUpdate(data->s->ctx, buf, &bytes, data->s->chunk, (int)data->firstThreadRem) != 1) {
+                fprintf(stderr, "EVP_DecryptUpdate failed\n");
+                EVP_CIPHER_CTX_free(data->s->ctx);
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        memcpy(data->s->chunk, buf, bytes);
+        free(buf);
+        data->s->chunksize = bytes;
+        if(data->s->dflag == true) {
+            /* Remove input (cipher) header offset before writing decrypted file chunk. */
+            offset -= HEADER_OFFSET;
+        } else {
+            /* Add input (cipher) header offset before writing encrypted file chunk. */
+            offset += HEADER_OFFSET;
+        }
         data->s->offset = offset;
         data->s->fetched = true;
     } 
     else {
+        data->s->chunksize = 0;
         data->s->readers_exited++;
         cond_signal(&data->s->readers[0]);
     }
@@ -220,7 +323,11 @@ void *reader_fn(void *arg) {
 void *writer_fn(void *arg) {
     writer_data *data = (writer_data *)arg;
     int fd;
-    if((fd = open(data->filepath, O_CREAT|O_WRONLY|O_TRUNC, S_IRUSR|S_IRGRP|S_IROTH|S_IWUSR)) == -1)
+    if(data->s->dflag == false)
+        fd = open(data->filepath, O_WRONLY);
+    else
+        fd = open(data->filepath, O_CREAT|O_WRONLY|O_TRUNC, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
+    if(fd == -1)
         exit_with_sys_err("writer open file");
     mutex_lock(&data->s->mutex);
     size_t sum = 0;
@@ -230,11 +337,16 @@ void *writer_fn(void *arg) {
 
         if(lseek(fd, data->s->offset, SEEK_SET) == -1)
             exit_with_sys_err("writer lseek");
-        if(write(fd, data->s->chunk, data->s->chunksize) == -1)
-            exit_with_sys_err("writer write");
-        sum += data->s->chunksize;
+        if(data->s->chunksize > 0) {
+            if(write(fd, data->s->chunk, data->s->chunksize) == -1)
+                exit_with_sys_err("writer chunk");
+            printf("WRITER %ld bytes written\n", data->s->chunksize);
+            sum += data->s->chunksize;
+        }
         /* All readers exited. End of work. */
         if(data->s->readers_exited == data->s->readers_n) {
+            printf("WRITER total %ld bytes written\n", sum);
+            EVP_CIPHER_CTX_free(data->s->ctx);
             break;
         }
         data->s->written = true;
@@ -244,8 +356,8 @@ void *writer_fn(void *arg) {
 
         // Print loading percentage
         if(data->filesize > 0) {
-            printf("\rCopying... %d%%", (int)((sum*100)/data->filesize));
-            fflush(stdout); // Flush the output buffer
+            // printf("\rEncrypting... %d%%", (int)((sum*100)/data->filesize));
+            // fflush(stdout); // Flush the output buffer
         }
     }
     mutex_unlock(&data->s->mutex);
@@ -260,6 +372,8 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
     int err;
+    /* Start measuring execution time. */
+    time_t start = time(NULL);
 
     bool dflag = false; // Decrypt flag
     if(strcmp(argv[1], "-d") == 0) {
@@ -272,6 +386,48 @@ int main(int argc, char *argv[]) {
     struct stat inputf; /* Input file stat */
     if((stat(argv[input_file_i], &inputf) == -1))
         exit_with_sys_err("stat");
+    off_t ifsize = inputf.st_size;
+
+    /* Prepare required input data for encryption/decryption. */
+    unsigned char *salt = malloc(sizeof(unsigned char) * SALT_LEN);
+    unsigned char *key = malloc(sizeof(unsigned char) * KEY_LEN);
+    unsigned char *iv = malloc(sizeof(unsigned char) * IV_LEN);
+    if(!salt || !key || !iv)
+        exit_with_err_msg("malloc");
+
+    if(dflag == true) {
+        /* Read salt and IV from input cipher file header in order to derive the key. */
+        int inputf = open(argv[input_file_i], O_RDONLY);
+        if (inputf < 0)
+            exit_with_sys_err("open input file");
+        if (read(inputf, salt, SALT_LEN) != SALT_LEN || read(inputf, iv, IV_LEN) != IV_LEN)
+            exit_with_sys_err("cannot read input file header");
+        close(inputf);
+        printf("SALT: %s\nIV: %s\n", salt, iv);
+        /* Ignore header length from total file size before chunk split. */
+        ifsize -= HEADER_OFFSET;
+    }
+    else {
+        /* Generate random salt for deriving the key. */
+        if (!RAND_bytes(salt, SALT_LEN))
+            exit_with_sys_err("RAND_bytes (salt)");
+        printf("Generated SALT: %s\n", salt);
+    }
+
+    /* Derive AES key from input password. */
+    printf("Password: %s\n", argv[input_file_i+2]);
+    derive_key_iv(argv[input_file_i+2], salt, key, iv);
+    printf("Derived key from passw: %s\n", key);
+    if(dflag == false) {
+        /* Write salt and IV to output cipher file header for future decryption. */
+        int outputf = open(argv[input_file_i+1], O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR|S_IWUSR);
+        if (outputf < 0)
+            exit_with_sys_err("open output file");
+        /* Write salt and IV at the beginning of output file. */
+        if (write(outputf, salt, SALT_LEN) != SALT_LEN || write(outputf, iv, IV_LEN) != IV_LEN)
+            exit_with_sys_err("write outputf header");
+        close(outputf);
+    }
 
     /* Fetch current number of CPU processors currently online */
     long cpu_cores_n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -296,39 +452,39 @@ int main(int argc, char *argv[]) {
     /* Total portions to split file into.  */
     unsigned int portions_n = 1;
     /* Bytes to read inside from the current portion of the file */
-    unsigned long chunksize = 0;
+    size_t chunksize = 0;
     /* Remaining bytes to read only within 1 portion of the file (the first one) */
-    unsigned long chunksizeRem = 0;
+    size_t chunksizeRem = 0;
     /* Any remaining bytes after bytes distribution among threads that must be
      * read only once by the FIRST thread. */
-    unsigned long firstThreadRem = 0;
+    size_t firstThreadRem = 0;
 
     /* Run using a single thread. */
-    if(inputf.st_size < MIN_FILE_SIZE) {
+    if(ifsize < MIN_FILE_SIZE) {
         readers_n = 1;
-        req_mem = inputf.st_size;
-        chunksize = inputf.st_size;
+        req_mem = ifsize;
+        chunksize = ifsize;
     } 
     /* All the `readers_n` threads will process the input file. */
     else {
         /* File is made up by only 1 portion. */
-        if(inputf.st_size <= portion_max_size) {
-            chunksize = (inputf.st_size / readers_n);
+        if(ifsize <= portion_max_size) {
+            chunksize = (ifsize / readers_n);
             /* Add any remaining bytes to read to the first reader thread. */
-            if(inputf.st_size % readers_n > 0) {
-                firstThreadRem = (inputf.st_size % readers_n);
+            if(ifsize % readers_n > 0) {
+                firstThreadRem = (ifsize % readers_n);
             }
-            req_mem = inputf.st_size;
+            req_mem = ifsize;
         }
         /* File is made up by more than 1 portion. */
         else {
             req_mem = portion_max_size;
 
-            portions_n = (unsigned int)(inputf.st_size / portion_max_size);
+            portions_n = (unsigned int)(ifsize / portion_max_size);
             chunksize = MAX_READER_CHUNK_SIZE;
             /* Add any extra bytes caused by divisions remainders: first reader thread might read
              * a bigger chunk than others (if there are any divisions reminders) */
-            unsigned long rem = inputf.st_size % portion_max_size;
+            unsigned long rem = ifsize % portion_max_size;
             if(rem > 0) {
                 if(rem < MIN_FILE_SIZE) {
                     firstThreadRem = rem;
@@ -350,20 +506,42 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    printf("File: %s (%lu bytes)... \n", argv[input_file_i], inputf.st_size);
+    printf("File: %s (%lu bytes)... \n", argv[input_file_i], ifsize);
     printf("File split in %u portions\n", portions_n);
-    printf("File Portion size %lu bytes \n", (inputf.st_size > portion_max_size) ? portion_max_size: inputf.st_size);
-    printf("CPU cores: %lu\n", cpu_cores_n);
+    printf("File Portion size %lu bytes \n", (ifsize > portion_max_size) ? portion_max_size: ifsize);
+    printf("Using %ld CPU cores\n", cpu_cores_n);
     printf("Starting %u threads; %u readers, %u writer\n", readers_n+1, readers_n, 1);
+
+    /* Initialize cipher context. */
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+        exit_with_err_msg("EVP_CIPHER_CTX_new failed");
+    if(dflag == false) {
+        if (EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, key, iv) != 1) {
+            fprintf(stderr, "EVP_EncryptInit_ex failed\n");
+            EVP_CIPHER_CTX_free(ctx);
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        if (EVP_DecryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, key, iv) != 1) {
+            fprintf(stderr, "EVP_DecryptInit_ex failed\n");
+            EVP_CIPHER_CTX_free(ctx);
+            exit(EXIT_FAILURE);
+        }
+    }
 
     /* Prepare shared data among threads. */
     shared_data shared;
     shared.turn = 0;
     shared.written = false;
     shared.fetched = false;
+    shared.dflag = dflag;
     shared.readers_exited = 0;
     shared.readers_n = readers_n;
     shared.chunk = NULL;
+    shared.key = key;
+    shared.iv = iv;
+    shared.ctx = ctx;
     if((err = pthread_mutex_init(&shared.mutex, NULL)) != 0)
         exit_with_err("pthread_mutex_init", err);
     if((err = pthread_cond_init(&shared.write, NULL)) != 0)
@@ -387,14 +565,14 @@ int main(int argc, char *argv[]) {
     }
     
     unsigned long total_bytes_to_process = ((chunksize*readers_n*(portions_n))+(chunksizeRem*readers_n)+firstThreadRem);
-    if(inputf.st_size != total_bytes_to_process) {
-        printf("Total input file bytes (%ld) mismatch after initial chunk processing %ld\n", inputf.st_size, total_bytes_to_process);
+    if(ifsize != total_bytes_to_process) {
+        printf("Total input file bytes (%ld) mismatch after initial chunk processing %ld\n", ifsize, total_bytes_to_process);
         exit(EXIT_FAILURE);
     }
 
     /* Prepare writer thread data. */
     writer_data writer;
-    writer.filesize = inputf.st_size;
+    writer.filesize = ifsize;
     if((writer.filepath = malloc(sizeof(char)*strlen(argv[input_file_i+1]))) == NULL)
         exit_with_sys_err("writer filepath malloc");
     strcpy(writer.filepath, argv[input_file_i+1]);
@@ -433,8 +611,13 @@ int main(int argc, char *argv[]) {
     }
     free(shared.chunk);
     free(shared.readers);
+    free(salt);
+    free(key);
+    free(iv);
     
-    printf("\nFile copied!\n");
+    /* Total execution time in seconds. */
+    long secs = (long)(time(NULL) - start);
+    printf("\nFile %s in %ld seconds!\n", (dflag) ? "decrypted" : "encrypted", secs);
     
     exit(EXIT_SUCCESS);
 }
