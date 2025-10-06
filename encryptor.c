@@ -34,6 +34,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <openssl/evp.h>
 #include <openssl/aes.h>
 #include <openssl/rand.h>
@@ -75,14 +76,14 @@ typedef struct {
     pthread_cond_t write;
     pthread_cond_t *readers;
     /* size of the file chunk to write (varies between processed file portions). */
-    size_t chunksize;
-    size_t offset; /* offset of the current chunk */
+    uint32_t chunksize;
+    uint64_t offset; /* offset of the current chunk */
     unsigned char *chunk;
     unsigned char *key; /* derived key from password */
     unsigned char *iv;
-    unsigned int turn; /* reader thread index inside array */
-    unsigned int readers_n; /* total reader threads */
-    unsigned int readers_exited; /* reader threads terminated */
+    uint16_t turn; /* reader thread index inside array */
+    uint16_t readers_n; /* total reader threads */
+    uint16_t readers_exited; /* reader threads terminated */
     bool written; /* writer work flag */
     bool fetched; /* reader work flag */
     bool dflag; /* decryption flag */
@@ -91,11 +92,11 @@ typedef struct {
 
 typedef struct {
     pthread_t tid;
-    unsigned int id;
-    unsigned long portions_n;
-    size_t chunksize;
-    size_t chunksizeRem; /* remaining bytes from division among reader(s)  */
-    size_t firstThreadRem; /* remaining bytes read only by the first reader */
+    uint16_t id;
+    uint16_t portions_n;
+    uint32_t chunksize;
+    uint32_t chunksizeRem; /* remaining bytes from division among reader(s)  */
+    uint32_t firstThreadRem; /* remaining bytes read only by the first reader */
     char *filepath;
     // shared
     shared_data *s;   
@@ -188,9 +189,9 @@ void *reader_fn(void *arg) {
     /* Start to read file portions: reader thread with id 0 reads the first chunk
      * for every file portion, reader with id 1 (if exists) reads the second chunk
      * inside each portion and so on. */
-    for(unsigned int i = 0; i < data->portions_n; i++) {
+    for(uint16_t i = 0; i < data->portions_n; i++) {
         unsigned char *c; /* chunk to encrypt/decrypt */
-        size_t csize; /* chunk size*/
+        uint32_t csize; /* chunk size*/
         if(i == 0)
             csize = data->chunksize+data->chunksizeRem;
         else
@@ -199,9 +200,9 @@ void *reader_fn(void *arg) {
         if((c = malloc(sizeof(unsigned char)*csize)) == NULL)
             exit_with_sys_err("reader chunk malloc");
         
-        size_t portionStartIndex = (csize*data->s->readers_n*i);
+        uint64_t portionStartIndex = (csize*data->s->readers_n*i);
         if(i > 0) portionStartIndex += (data->chunksizeRem*data->s->readers_n);
-        size_t offset = (portionStartIndex + (csize*data->id));
+        uint64_t offset = (portionStartIndex + (csize*data->id));
 
         if(data->s->dflag == true) {
             /* Add input (cipher) header offset before reading encrypted file chunk. */
@@ -282,7 +283,7 @@ void *reader_fn(void *arg) {
         data->s->readers_exited++;
         data->s->turn = data->s->readers_n-1;
         /* Start of last portion where the remaining bytes must be written. */
-        size_t offset = (data->chunksize*data->s->readers_n*data->portions_n)+(data->chunksizeRem*data->s->readers_n);
+        uint64_t offset = (data->chunksize*data->s->readers_n*data->portions_n)+(data->chunksizeRem*data->s->readers_n);
         if(data->s->dflag == true)
             offset += HEADER_OFFSET;
 
@@ -356,7 +357,7 @@ void *writer_fn(void *arg) {
     if(fd == -1)
         exit_with_sys_err("writer open file");
     mutex_lock(&data->s->mutex);
-    size_t sum = 0;
+    uint64_t sum = 0;
     while(1) {
         while(data->s->fetched == false && data->s->readers_exited < data->s->readers_n)
             cond_wait(&data->s->write, &data->s->mutex);
@@ -404,13 +405,16 @@ int main(int argc, char *argv[]) {
         dflag = true;
     }
 
-    int input_file_i = 1;
+    uint8_t input_file_i = 1;
     if(dflag) input_file_i++; 
 
     struct stat inputf; /* Input file stat */
     if((stat(argv[input_file_i], &inputf) == -1))
         exit_with_sys_err("stat");
-    off_t ifsize = inputf.st_size;
+    if (inputf.st_size < 0)
+        exit_with_err_msg("invalid filesize value");
+
+    uint64_t ifsize = (uint64_t)inputf.st_size;
 
     /* Prepare required input data for encryption/decryption. */
     unsigned char *salt = malloc(sizeof(unsigned char) * SALT_LEN);
@@ -457,27 +461,27 @@ int main(int argc, char *argv[]) {
         cpu_cores_n = 1;
     /* The number of reader threads will be cpu_cores_n - 1 (or 1) so that
     * 1 processor can be used by the only writer thread. */
-    unsigned int readers_n = (cpu_cores_n > 1) ? cpu_cores_n - 1 : 1;
+    uint16_t readers_n = (cpu_cores_n > 1) ? cpu_cores_n - 1 : 1;
 
     /* Fetch current available free memory */
     struct sysinfo sys;
     if (sysinfo(&sys) == -1) {
         exit_with_sys_err("sysinfo");
     }
-    unsigned long req_mem = MIN_FILE_SIZE; /* free memory required to run */
+    uint32_t req_mem = MIN_FILE_SIZE; /* free memory required to run */
     /* Consider 80% of the free memory to prevent filling it excessively. */
-    unsigned long free_mem = (unsigned long)(sys.freeram*0.8);
+    uint32_t free_mem = (uint32_t)(sys.freeram*0.8);
     /* Size of the biggest file portion processable without losing efficiency. */
-    const unsigned long portion_max_size = (readers_n*MAX_READER_CHUNK_SIZE); 
+    const uint32_t portion_max_size = (readers_n*MAX_READER_CHUNK_SIZE); 
     /* Total portions to split file into.  */
-    unsigned int portions_n = 1;
+    uint16_t portions_n = 1;
     /* Bytes to read inside from the current portion of the file */
-    size_t chunksize = 0;
+    uint32_t chunksize = 0;
     /* Remaining bytes to read only within 1 portion of the file (the first one) */
-    size_t chunksizeRem = 0;
+    uint32_t chunksizeRem = 0;
     /* Any remaining bytes after bytes distribution among threads that must be
      * read only once by the FIRST thread. */
-    size_t firstThreadRem = 0;
+    uint32_t firstThreadRem = 0;
 
     /* Run using a single thread. */
     if(ifsize < MIN_FILE_SIZE) {
@@ -500,11 +504,11 @@ int main(int argc, char *argv[]) {
         else {
             req_mem = portion_max_size;
 
-            portions_n = (unsigned int)(ifsize / portion_max_size);
+            portions_n = (uint16_t)(ifsize / portion_max_size);
             chunksize = MAX_READER_CHUNK_SIZE;
             /* Add any extra bytes caused by divisions remainders: first reader thread might read
              * a bigger chunk than others (if there are any divisions reminders) */
-            unsigned long rem = ifsize % portion_max_size;
+            uint32_t rem = ifsize % portion_max_size;
             if(rem > 0) {
                 if(rem < MIN_FILE_SIZE) {
                     firstThreadRem = rem;
@@ -567,12 +571,12 @@ int main(int argc, char *argv[]) {
     if((err = pthread_cond_init(&shared.write, NULL)) != 0)
         exit_with_err("pthread_cond_init", err);
     shared.readers = malloc(sizeof(pthread_cond_t) * readers_n);
-    for(unsigned int i = 0; i < readers_n; i++)
+    for(uint16_t i = 0; i < readers_n; i++)
         pthread_cond_init(&shared.readers[i], NULL);
 
     /* Prepare readers threads data */
     reader_data readers[readers_n];
-    for(unsigned int i = 0; i < readers_n; i++) {
+    for(uint16_t i = 0; i < readers_n; i++) {
         readers[i].id = i;
         if((readers[i].filepath = malloc(sizeof(char)*strlen(argv[input_file_i]))) == NULL)
             exit_with_sys_err("filepath malloc");
@@ -584,9 +588,9 @@ int main(int argc, char *argv[]) {
         readers[i].s = &shared;
     }
     
-    unsigned long total_bytes_to_process = ((chunksize*readers_n*(portions_n))+(chunksizeRem*readers_n)+firstThreadRem);
+    uint64_t total_bytes_to_process = ((chunksize*readers_n*(portions_n))+(chunksizeRem*readers_n)+firstThreadRem);
     if(ifsize != total_bytes_to_process) {
-        printf("Total input file bytes (%ld) mismatch after initial chunk processing %ld\n", ifsize, total_bytes_to_process);
+        printf("Total input file bytes (%ld) mismatch after initial chunk processing %lu\n", ifsize, total_bytes_to_process);
         exit(EXIT_FAILURE);
     }
 
@@ -601,7 +605,7 @@ int main(int argc, char *argv[]) {
     /* Create threads. */
     if((err = pthread_create(&writer.tid, NULL, writer_fn, &writer)) != 0)
         exit_with_err("pthread_create", err);
-    for(unsigned int i = 0; i < readers_n; i++) {
+    for(uint16_t i = 0; i < readers_n; i++) {
         if((err = pthread_create(&readers[i].tid, NULL, reader_fn, &readers[i])) != 0)
             exit_with_err("pthread_create", err);
     }
@@ -609,7 +613,7 @@ int main(int argc, char *argv[]) {
     /* Wait for threads termination. */
     if((err = pthread_join(writer.tid, NULL)) != 0)
         exit_with_err("pthread_join", err);
-    for(unsigned int i = 0; i < readers_n; i++) {
+    for(uint16_t i = 0; i < readers_n; i++) {
         if((err = pthread_join(readers[i].tid, NULL)) != 0)
             exit_with_err("pthread_join", err);
     }
@@ -619,14 +623,14 @@ int main(int argc, char *argv[]) {
         exit_with_err("pthread_mutex_destroy", err);
     if((err = pthread_cond_destroy(&shared.write)) != 0)
         exit_with_err("pthread_cond_destroy", err);
-    for(unsigned int i = 0; i < readers_n; i++) {
+    for(uint16_t i = 0; i < readers_n; i++) {
         if((err = pthread_cond_destroy(&shared.readers[i])) != 0)
             exit_with_err("pthread_cond_destroy", err); 
     }
 
     /* Free allocated memory */
     free(writer.filepath);
-    for(unsigned int i = 0; i < readers_n; i++) {
+    for(uint16_t i = 0; i < readers_n; i++) {
         free(readers[i].filepath);
     }
     free(shared.chunk);
