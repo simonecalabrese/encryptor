@@ -47,8 +47,9 @@
 
 #define SALT_LEN 16 /* required to derive the key from a password. */
 #define KEY_LEN 32 /* AES key fixed-length of 256 bit. */
-#define IV_LEN 16 /* inizialization vector length. */
-#define HEADER_OFFSET SALT_LEN+IV_LEN
+#define NONCE_LEN 12 /* base nonce length. */
+#define CHUNK_COUNTER_LEN 4 /* chunk counter (identifier) length. */
+#define HEADER_OFFSET SALT_LEN+NONCE_LEN
 /* More info at: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html */
 #define PBKDF2_ITERATIONS 100000
 
@@ -80,14 +81,13 @@ typedef struct {
     uint64_t offset; /* offset of the current chunk */
     unsigned char *chunk;
     unsigned char *key; /* derived key from password */
-    unsigned char *iv;
+    unsigned char *nonce;
     uint16_t turn; /* reader thread index inside array */
-    uint16_t readers_n; /* total reader threads */
+    uint16_t readers_n; /* total reader threads (or chunks in each portion). */
     uint16_t readers_exited; /* reader threads terminated */
     bool written; /* writer work flag */
     bool fetched; /* reader work flag */
     bool dflag; /* decryption flag */
-    EVP_CIPHER_CTX *ctx;
 } shared_data;
 
 typedef struct {
@@ -140,22 +140,75 @@ void cond_signal(pthread_cond_t *cond) {
         exit_with_err("pthread_cond_signal", err);
 }
 
-/* Derive a `key` for ciphering operations from user `password`,`salt` and `iv` using PBKDF2.
- * NOTE: The salt parameter must be previously randomly generated or the previously
- * used value to encrypt the file that now must be decrypted; the iv must be managed like
+/* Derive a `key` and a `nonce` for cryptographic operations from user `password` and `salt` using PBKDF2.
+ * NOTE: The salt parameter must be previously randomly generated or should be the previously
+ * value used to encrypt the file which now must be decrypted; the nonce must be managed like
  * the salt except that it is automatically generated if a previous value is not passed. */
-void derive_key_iv(const char *passw, unsigned char *salt, unsigned char *key, unsigned char *iv) {
-    unsigned char key_iv[KEY_LEN + IV_LEN];
+void derive_key_nonce(const char *passw, unsigned char *salt, unsigned char *key, unsigned char *nonce) {
+    unsigned char key_nonce[KEY_LEN + NONCE_LEN];
 
-    if (!PKCS5_PBKDF2_HMAC(passw, strlen(passw), salt, SALT_LEN, PBKDF2_ITERATIONS, EVP_sha256(), sizeof(key_iv), key_iv)) {
-        fprintf(stderr, "PBKDF2 failed\n");
-        exit(EXIT_FAILURE);
-    }
+    if (!PKCS5_PBKDF2_HMAC(passw, strlen(passw), salt, SALT_LEN, PBKDF2_ITERATIONS, EVP_sha256(), sizeof(key_nonce), key_nonce))
+        exit_with_err_msg("PBKDF2 failed");
 
-    memcpy(key, key_iv, KEY_LEN);
-    memcpy(iv, key_iv + KEY_LEN, IV_LEN);
+    memcpy(key, key_nonce, KEY_LEN);
+    memcpy(nonce, key_nonce + KEY_LEN, NONCE_LEN);
 }
 
+/* Convert passed uint32 `val` to uint8[4] Big Endian `out`. */
+void uint32_to_bytes_be(uint32_t val, uint8_t out[4]) {
+    out[0] = (val >> 24) & 0xFF;
+    out[1] = (val >> 16) & 0xFF;
+    out[2] = (val >> 8)  & 0xFF;
+    out[3] = val & 0xFF;
+}
+
+/* Encrypt a file chunk using a unique IV composed by nonce + chunk_unique_index. */
+int encrypt_chunk(unsigned char *out, const unsigned char *in, const int inlen, const unsigned char *key, const unsigned char *nonce, const uint32_t chunk_index) {
+    /* Build iv from nonce + chunk_index. */
+    unsigned char iv[NONCE_LEN+CHUNK_COUNTER_LEN];
+    memcpy(iv, nonce, NONCE_LEN);
+    uint8_t chunk_i_be[4];
+    uint32_to_bytes_be(chunk_index, chunk_i_be);
+    memcpy(iv+NONCE_LEN, &chunk_i_be, sizeof(chunk_i_be));
+    // aes_256_ctr_encrypt_chunk(key, nonce, chunk_index, in, out, inlen);
+    int outlen = 0;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) exit_with_err_msg("EVP_CIPHER_CTX_new failed");
+
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, key, iv) != 1)
+        exit_with_err_msg("EVP_EncryptInit_ex failed");
+    
+    if (EVP_EncryptUpdate(ctx, out, &outlen, in, inlen) != 1)
+        exit_with_err_msg("EVP_EncryptUpdate failed");
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    return outlen;
+}
+
+/* Decrypt a file chunk using the corresponding chunk IV composed by nonce + chunk_unique_index. */
+int decrypt_chunk(unsigned char *outbuf, const unsigned char *inbuf, const int inlen, const unsigned char *key, const unsigned char *nonce, const uint32_t chunk_index) {
+    /* Build iv from nonce + chunk_index. */
+    unsigned char iv[NONCE_LEN+CHUNK_COUNTER_LEN];
+    memcpy(iv, nonce, NONCE_LEN);
+    uint8_t chunk_i_be[4];
+    uint32_to_bytes_be(chunk_index, chunk_i_be);
+    memcpy(iv+NONCE_LEN, &chunk_i_be, sizeof(chunk_i_be));
+    // aes_256_ctr_decrypt_chunk(key, nonce, chunk_index, inbuf, outbuf, inlen);
+    int outlen = 0;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) exit_with_err_msg("EVP_CIPHER_CTX_new failed");
+
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, key, iv) != 1)
+        exit_with_err_msg("EVP_DecryptInit_ex failed");
+    
+    if (EVP_DecryptUpdate(ctx, outbuf, &outlen, inbuf, inlen) != 1)
+        exit_with_err_msg("EVP_DecryptUpdate failed");
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    return outlen;
+}
 
 /* Reader thread function.
  * Each reader thread reads a file chunk at time for every portion the file has been split.
@@ -200,9 +253,9 @@ void *reader_fn(void *arg) {
         if((c = malloc(sizeof(unsigned char)*csize)) == NULL)
             exit_with_sys_err("reader chunk malloc");
         
-        uint64_t portionStartIndex = (csize*data->s->readers_n*i);
-        if(i > 0) portionStartIndex += (data->chunksizeRem*data->s->readers_n);
-        uint64_t offset = (portionStartIndex + (csize*data->id));
+        uint64_t portionStart = (csize*data->s->readers_n*i);
+        if(i > 0) portionStart += (data->chunksizeRem*data->s->readers_n);
+        uint64_t offset = (portionStart + (csize*data->id));
 
         if(data->s->dflag == true) {
             /* Add input (cipher) header offset before reading encrypted file chunk. */
@@ -229,20 +282,10 @@ void *reader_fn(void *arg) {
             cond_wait(&data->s->readers[data->id], &data->s->mutex);
 
         if(data->s->dflag == false) {
-            if (EVP_EncryptUpdate(data->s->ctx, buf, &bytes, c, (int)csize) != 1) {
-                fprintf(stderr, "EVP_EncryptUpdate failed\n");
-                EVP_CIPHER_CTX_free(data->s->ctx);
-                exit(EXIT_FAILURE);
-            }
+            bytes = encrypt_chunk(buf, c, (int)csize, data->s->key, data->s->nonce, (data->id+(i*data->s->readers_n)));
         } else {
-            if (EVP_DecryptUpdate(data->s->ctx, buf, &bytes, c, (int)csize) != 1) {
-                fprintf(stderr, "EVP_DecryptUpdate failed\n");
-                EVP_CIPHER_CTX_free(data->s->ctx);
-                exit(EXIT_FAILURE);
-            }
+            bytes = decrypt_chunk(buf, c, (int)csize, data->s->key, data->s->nonce, (data->id+(i*data->s->readers_n)));
         }
-        if(bytes == 0) exit_with_sys_err("BYTES0");
-
         free(c);
         
         if((data->s->chunk = realloc(data->s->chunk, sizeof(unsigned char)*bytes)) == NULL)
@@ -301,21 +344,11 @@ void *reader_fn(void *arg) {
         if((buf = malloc(sizeof(unsigned char)*(data->firstThreadRem+EVP_MAX_BLOCK_LENGTH))) == NULL)
             exit_with_sys_err("reader buf malloc");
         int bytes = 0; /* bytes encrypted/decrypted. */
-    
         if(data->s->dflag == false) {
-            if (EVP_EncryptUpdate(data->s->ctx, buf, &bytes, data->s->chunk, (int)data->firstThreadRem) != 1) {
-                fprintf(stderr, "EVP_EncryptUpdate failed\n");
-                EVP_CIPHER_CTX_free(data->s->ctx);
-                exit(EXIT_FAILURE);
-            }
+            bytes = encrypt_chunk(buf, data->s->chunk, (int)data->firstThreadRem, data->s->key, data->s->nonce, (data->id+(data->portions_n*data->s->readers_n)));
         } else {
-            if (EVP_DecryptUpdate(data->s->ctx, buf, &bytes, data->s->chunk, (int)data->firstThreadRem) != 1) {
-                fprintf(stderr, "EVP_DecryptUpdate failed\n");
-                EVP_CIPHER_CTX_free(data->s->ctx);
-                exit(EXIT_FAILURE);
-            }
+            bytes = decrypt_chunk(buf, data->s->chunk, (int)data->firstThreadRem, data->s->key, data->s->nonce, (data->id+(data->portions_n*data->s->readers_n)));
         }
-
         memcpy(data->s->chunk, buf, bytes);
         free(buf);
         data->s->chunksize = bytes;
@@ -371,7 +404,6 @@ void *writer_fn(void *arg) {
         }
         /* All readers exited. End of work. */
         if(data->s->readers_exited == data->s->readers_n) {
-            EVP_CIPHER_CTX_free(data->s->ctx);
             break;
         }
         data->s->written = true;
@@ -419,16 +451,16 @@ int main(int argc, char *argv[]) {
     /* Prepare required input data for encryption/decryption. */
     unsigned char *salt = malloc(sizeof(unsigned char) * SALT_LEN);
     unsigned char *key = malloc(sizeof(unsigned char) * KEY_LEN);
-    unsigned char *iv = malloc(sizeof(unsigned char) * IV_LEN);
-    if(!salt || !key || !iv)
+    unsigned char *nonce = malloc(sizeof(unsigned char) * NONCE_LEN);
+    if(!salt || !key || !nonce)
         exit_with_err_msg("malloc");
 
     if(dflag == true) {
-        /* Read salt and IV from input cipher file header in order to derive the key. */
+        /* Read salt and nonce from input cipher file header in order to derive the key. */
         int inputf = open(argv[input_file_i], O_RDONLY);
         if (inputf < 0)
             exit_with_sys_err("open input file");
-        if (read(inputf, salt, SALT_LEN) != SALT_LEN || read(inputf, iv, IV_LEN) != IV_LEN)
+        if (read(inputf, salt, SALT_LEN) != SALT_LEN || read(inputf, nonce, NONCE_LEN) != NONCE_LEN)
             exit_with_sys_err("cannot read input file header");
         close(inputf);
         /* Ignore header length from total file size before chunk split. */
@@ -441,14 +473,14 @@ int main(int argc, char *argv[]) {
     }
 
     /* Derive AES key from input password. */
-    derive_key_iv(argv[input_file_i+2], salt, key, iv);
+    derive_key_nonce(argv[input_file_i+2], salt, key, nonce);
     if(dflag == false) {
-        /* Write salt and IV to output cipher file header for future decryption. */
+        /* Write salt and nonce to output cipher file header for future decryption. */
         int outputf = open(argv[input_file_i+1], O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR|S_IWUSR);
         if (outputf < 0)
             exit_with_sys_err("open output file");
-        /* Write salt and IV at the beginning of output file. */
-        if (write(outputf, salt, SALT_LEN) != SALT_LEN || write(outputf, iv, IV_LEN) != IV_LEN)
+        /* Write salt and nonce at the beginning of output file. */
+        if (write(outputf, salt, SALT_LEN) != SALT_LEN || write(outputf, nonce, NONCE_LEN) != NONCE_LEN)
             exit_with_sys_err("write outputf header");
         close(outputf);
     }
@@ -536,24 +568,6 @@ int main(int argc, char *argv[]) {
     printf("Using %ld CPU cores\n", cpu_cores_n);
     printf("Starting %u threads; %u readers, %u writer\n", readers_n+1, readers_n, 1);
 
-    /* Initialize cipher context. */
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx)
-        exit_with_err_msg("EVP_CIPHER_CTX_new failed");
-    if(dflag == false) {
-        if (EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, key, iv) != 1) {
-            fprintf(stderr, "EVP_EncryptInit_ex failed\n");
-            EVP_CIPHER_CTX_free(ctx);
-            exit(EXIT_FAILURE);
-        }
-    } else {
-        if (EVP_DecryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, key, iv) != 1) {
-            fprintf(stderr, "EVP_DecryptInit_ex failed\n");
-            EVP_CIPHER_CTX_free(ctx);
-            exit(EXIT_FAILURE);
-        }
-    }
-
     /* Prepare shared data among threads. */
     shared_data shared;
     shared.turn = 0;
@@ -564,8 +578,7 @@ int main(int argc, char *argv[]) {
     shared.readers_n = readers_n;
     shared.chunk = NULL;
     shared.key = key;
-    shared.iv = iv;
-    shared.ctx = ctx;
+    shared.nonce = nonce;
     if((err = pthread_mutex_init(&shared.mutex, NULL)) != 0)
         exit_with_err("pthread_mutex_init", err);
     if((err = pthread_cond_init(&shared.write, NULL)) != 0)
@@ -637,7 +650,7 @@ int main(int argc, char *argv[]) {
     free(shared.readers);
     free(salt);
     free(key);
-    free(iv);
+    free(nonce);
     
     /* Total execution time in seconds. */
     long secs = (long)(time(NULL) - start);
