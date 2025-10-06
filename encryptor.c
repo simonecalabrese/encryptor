@@ -292,13 +292,11 @@ void *reader_fn(void *arg) {
         memcpy(data->s->chunk, buf, bytes);
         free(buf);
         data->s->chunksize = bytes;
-        if(data->s->dflag == true) {
-            /* Remove input (cipher) header offset before writing decrypted file chunk. */
+        /* Add or remove file header offset for cryptographic operations before writing decrypted file chunk. */
+        if(data->s->dflag == true)
             offset -= HEADER_OFFSET;
-        } else {
-            /* Add input (cipher) header offset before writing encrypted file chunk. */
+        else
             offset += HEADER_OFFSET;
-        }
         data->s->offset = offset;
         data->s->fetched = true;
         /* Wake writer */
@@ -351,13 +349,11 @@ void *reader_fn(void *arg) {
         memcpy(data->s->chunk, buf, bytes);
         free(buf);
         data->s->chunksize = bytes;
-        if(data->s->dflag == true) {
-            /* Remove input (cipher) header offset before writing decrypted file chunk. */
+        /* Add or remove file header offset for cryptographic operations before writing decrypted file chunk. */
+        if(data->s->dflag == true)
             offset -= HEADER_OFFSET;
-        } else {
-            /* Add input (cipher) header offset before writing encrypted file chunk. */
+        else
             offset += HEADER_OFFSET;
-        }
         data->s->offset = offset;
         data->s->fetched = true;
     } 
