@@ -43,7 +43,7 @@
 #define MAX_READER_CHUNK_SIZE 1024*1024*16
 /* Minimum file size to enable multithread execution. */
 #define MIN_FILE_SIZE (1024*16) + 1
-
+#define QUEUE_CAPACITY 10 /* queue capacity for file chunks. */
 #define SALT_LEN 16 /* required to derive the key from a password. */
 #define KEY_LEN 32 /* AES key fixed-length of 256 bit. */
 #define NONCE_LEN 12 /* base nonce length. */
@@ -67,25 +67,98 @@
     exit(EXIT_FAILURE);             \
 }
 
-/* This struct contains all the shared informations that must be filled in
-* every time a reader finishes to encrypt/decrypt a (file) portion chunk.
-* Only one file chunk at a time will be stored inside this structure and 
-* written to the output file by the writer thread.  */
+/* File chunk fetched by the writer thread and written to output file. */
 typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t write;
-    pthread_cond_t *readers;
     /* size of the file chunk to write (varies between processed file portions). */
     uint32_t chunksize;
     uint64_t offset; /* offset of the current chunk */
     unsigned char *chunk;
-    unsigned char *key; /* derived key from password */
-    unsigned char *nonce;
-    uint16_t turn; /* reader thread index inside array */
+} file_chunk;
+
+
+/* ---------------------- Circular queue implementation -------------------- */
+
+/* Fixed-capacity queue to store encrypted/decrypted file chunks.  */
+typedef struct {
+    file_chunk **data;
+    int32_t in;
+    int32_t out;
+    int32_t size;
+    int32_t capacity;
+} queue_t;
+
+void queue_init(queue_t *q, int32_t capacity) {
+    if(!q || capacity == 0) exit_with_err_msg("queue_init");
+
+    if((q->data = malloc(sizeof(file_chunk *) * capacity)) == NULL) 
+        exit_with_sys_err("malloc queue");
+    q->size = q->in = q->out = 0;
+    q->capacity = capacity;
+}
+
+void queue_push(queue_t *q, uint32_t chunksize, uint64_t offset, unsigned char *chunk) {
+    if(!q || !chunk || q->size >= q->capacity)
+        exit_with_err_msg("queue_push");
+    
+    if((q->data[q->in] = malloc(sizeof(file_chunk))) == NULL)
+        exit_with_sys_err("malloc queue push");
+    if((q->data[q->in]->chunk = malloc(sizeof(unsigned char) * chunksize)) == NULL)
+        exit_with_sys_err("malloc queue node attr");    
+    memcpy(q->data[q->in]->chunk, chunk, chunksize);
+    q->data[q->in]->chunksize = chunksize;
+    q->data[q->in]->offset = offset;
+
+    q->in = (q->in + 1) % q->capacity;
+    q->size++;
+}
+
+file_chunk *queue_pop(queue_t *q) {
+    if(!q || q->size <= 0 || q->capacity == 0)
+        exit_with_err_msg("queue_pop");
+
+    file_chunk *src = q->data[q->out];
+    file_chunk *fc = malloc(sizeof(file_chunk));
+    if (!fc)
+        exit_with_sys_err("malloc queue pop");
+
+    fc->chunksize = src->chunksize;
+    fc->offset = src->offset;
+    fc->chunk = malloc(fc->chunksize*sizeof(unsigned char));
+    if (!fc->chunk)
+        exit_with_sys_err("malloc queue chunk");
+    memcpy(fc->chunk, src->chunk, fc->chunksize);
+
+    free(src->chunk);
+    free(src);
+    q->data[q->out] = NULL;
+    
+    q->out = (q->out + 1) % q->capacity;
+    q->size--;
+    return fc;
+}
+
+void queue_destroy(queue_t *q) {
+    if(!q || q->capacity == 0) exit_with_err_msg("queue_destroy");
+    if(q->size == 0) return;
+    for(int32_t i = 0; i < q->size; i++) {
+        if(q->data[i] != NULL) {
+            free(q->data[i]->chunk);
+            free(q->data[i]);
+            q->data[i] = NULL;
+        }
+    }
+    free(q->data);
+}
+
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t full;
+    pthread_cond_t empty;
+    queue_t *q; /* queue to store processed file chunks to write. */
     uint16_t readers_n; /* total reader threads (or chunks in each portion). */
     uint16_t readers_exited; /* reader threads terminated */
-    bool written; /* writer work flag */
-    bool fetched; /* reader work flag */
     bool dflag; /* decryption flag */
 } shared_data;
 
@@ -97,6 +170,8 @@ typedef struct {
     uint32_t chunksizeRem; /* remaining bytes from division among reader(s)  */
     uint32_t firstThreadRem; /* remaining bytes read only by the first reader */
     char *filepath;
+    const unsigned char *key; /* derived key from password */
+    const unsigned char *nonce;
     // shared
     shared_data *s;   
 } reader_data;
@@ -241,7 +316,11 @@ void *reader_fn(void *arg) {
     /* Start to read file portions: reader thread with id 0 reads the first chunk
      * for every file portion, reader with id 1 (if exists) reads the second chunk
      * inside each portion and so on. */
-    for(uint16_t i = 0; i < data->portions_n; i++) {
+    uint16_t portions_n = data->portions_n;
+    /* First reader must read extra bytes (reminder) so it needs to process
+     * an extra file portion. */
+    if(data->id == 0) portions_n++;
+    for(uint16_t i = 0; i < portions_n; i++) {
         unsigned char *c; /* chunk to encrypt/decrypt */
         uint32_t csize; /* chunk size*/
         if(i == 0)
@@ -256,6 +335,13 @@ void *reader_fn(void *arg) {
         if(i > 0) portionStart += (data->chunksizeRem*data->s->readers_n);
         uint64_t offset = (portionStart + (csize*data->id));
 
+        if(data->id == 0 && i == portions_n-1) {
+            /* Start of last portion where the remaining bytes must be written. */
+            offset = (data->chunksize*data->s->readers_n*data->portions_n)+(data->chunksizeRem*data->s->readers_n);
+            csize = data->firstThreadRem;
+        }
+            
+
         if(data->s->dflag == true) {
             /* Add input (cipher) header offset before reading encrypted file chunk. */
             offset += HEADER_OFFSET;
@@ -267,6 +353,12 @@ void *reader_fn(void *arg) {
         /* Read chunk from file. */
         if(read(fd, c, csize) == -1)
             exit_with_sys_err("reader read");
+        
+        /* Add or remove file header offset for cryptographic operations before writing decrypted file chunk. */
+        if(data->s->dflag == true)
+            offset -= HEADER_OFFSET;
+        else
+            offset += HEADER_OFFSET;
 
         /* Buffer for encryption/decryption result. */
         unsigned char *buf;
@@ -274,98 +366,34 @@ void *reader_fn(void *arg) {
             exit_with_sys_err("reader buf malloc");
         int bytes = 0; /* bytes encrypted/decrypted. */
 
+        if(data->s->dflag == false)
+            bytes = encrypt_chunk(buf, c, (int)csize, data->key, data->nonce, (data->id+(i*data->s->readers_n)));
+        else
+            bytes = decrypt_chunk(buf, c, (int)csize, data->key, data->nonce, (data->id+(i*data->s->readers_n)));
+        free(c);
+
         mutex_lock(&data->s->mutex);
 
-        /* Wait for its turn to send chunk to writer. */
-        while(data->s->turn != data->id)
-            cond_wait(&data->s->readers[data->id], &data->s->mutex);
+        /* File chunks queue is full: wait for writer. */
+        while(data->s->q->size == data->s->q->capacity)
+            cond_wait(&data->s->empty, &data->s->mutex);
+        /* Push processed file chunk into queue. */
 
-        if(data->s->dflag == false) {
-            bytes = encrypt_chunk(buf, c, (int)csize, data->s->key, data->s->nonce, (data->id+(i*data->s->readers_n)));
-        } else {
-            bytes = decrypt_chunk(buf, c, (int)csize, data->s->key, data->s->nonce, (data->id+(i*data->s->readers_n)));
-        }
-        free(c);
-        
-        if((data->s->chunk = realloc(data->s->chunk, sizeof(unsigned char)*bytes)) == NULL)
-            exit_with_sys_err("reader realloc shared chunk");
-        memcpy(data->s->chunk, buf, bytes);
-        free(buf);
-        data->s->chunksize = bytes;
-        /* Add or remove file header offset for cryptographic operations before writing decrypted file chunk. */
-        if(data->s->dflag == true)
-            offset -= HEADER_OFFSET;
-        else
-            offset += HEADER_OFFSET;
-        data->s->offset = offset;
-        data->s->fetched = true;
-        /* Wake writer */
-        cond_signal(&data->s->write);
-        /* Wait for writer */
-        while(!data->s->written)
-            cond_wait(&data->s->write, &data->s->mutex);
-        data->s->written = false;
-        data->s->turn = (data->s->turn+1)%data->s->readers_n;
-
-        /* Wake readers */
-        cond_signal(&data->s->readers[data->s->turn]);
-
+        queue_push(data->s->q, bytes, offset, buf);
+        /* Wake writer. */
+        cond_signal(&data->s->full);
         mutex_unlock(&data->s->mutex);
+
+        free(buf);
     }
     
     mutex_lock(&data->s->mutex);
-
-    /* First reader must read extra bytes (reminder) after all the other readers exited. */
-    if(data->id == 0 && data->firstThreadRem > 0) {
-        while(data->s->readers_exited < data->s->readers_n-1)
-            cond_wait(&data->s->readers[0], &data->s->mutex);
-
-        data->s->readers_exited++;
-        data->s->turn = data->s->readers_n-1;
-        /* Start of last portion where the remaining bytes must be written. */
-        uint64_t offset = (data->chunksize*data->s->readers_n*data->portions_n)+(data->chunksizeRem*data->s->readers_n);
-        if(data->s->dflag == true)
-            offset += HEADER_OFFSET;
-
-        if(lseek(fd, offset, SEEK_SET) == -1)
-            exit_with_sys_err("reader final lseek");
-
-        if((data->s->chunk = realloc(data->s->chunk, sizeof(unsigned char)*data->firstThreadRem)) == NULL)
-            exit_with_sys_err("reader realloc shared chunk");
-
-        /* Read chunk from file. */
-        if(read(fd, data->s->chunk, data->firstThreadRem) == -1)
-            exit_with_sys_err("reader read");
-
-        unsigned char *buf;
-        if((buf = malloc(sizeof(unsigned char)*(data->firstThreadRem+EVP_MAX_BLOCK_LENGTH))) == NULL)
-            exit_with_sys_err("reader buf malloc");
-        int bytes = 0; /* bytes encrypted/decrypted. */
-        if(data->s->dflag == false) {
-            bytes = encrypt_chunk(buf, data->s->chunk, (int)data->firstThreadRem, data->s->key, data->s->nonce, (data->id+(data->portions_n*data->s->readers_n)));
-        } else {
-            bytes = decrypt_chunk(buf, data->s->chunk, (int)data->firstThreadRem, data->s->key, data->s->nonce, (data->id+(data->portions_n*data->s->readers_n)));
-        }
-        memcpy(data->s->chunk, buf, bytes);
-        free(buf);
-        data->s->chunksize = bytes;
-        /* Add or remove file header offset for cryptographic operations before writing decrypted file chunk. */
-        if(data->s->dflag == true)
-            offset -= HEADER_OFFSET;
-        else
-            offset += HEADER_OFFSET;
-        data->s->offset = offset;
-        data->s->fetched = true;
-    } 
-    else {
-        data->s->chunksize = 0;
-        data->s->readers_exited++;
-        cond_signal(&data->s->readers[0]);
-    }
     
+    data->s->readers_exited++;
+
     if(data->s->readers_exited == data->s->readers_n) {
         /* Wake writer. End of work. */
-        cond_signal(&data->s->write);
+        cond_signal(&data->s->full);
     }
 
     mutex_unlock(&data->s->mutex);
@@ -384,35 +412,52 @@ void *writer_fn(void *arg) {
         fd = open(data->filepath, O_CREAT|O_WRONLY|O_TRUNC, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
     if(fd == -1)
         exit_with_sys_err("writer open file");
-    mutex_lock(&data->s->mutex);
     uint64_t sum = 0;
+    bool end = false;
     while(1) {
-        while(data->s->fetched == false && data->s->readers_exited < data->s->readers_n)
-            cond_wait(&data->s->write, &data->s->mutex);
+        mutex_lock(&data->s->mutex);
 
-        if(lseek(fd, data->s->offset, SEEK_SET) == -1)
-            exit_with_sys_err("writer lseek");
-        if(data->s->chunksize > 0) {
-            if(write(fd, data->s->chunk, data->s->chunksize) == -1)
-                exit_with_sys_err("writer chunk");
-            sum += data->s->chunksize;
-        }
-        /* All readers exited. End of work. */
-        if(data->s->readers_exited == data->s->readers_n) {
+        while(data->s->q->size == 0 && data->s->readers_exited < data->s->readers_n)
+            cond_wait(&data->s->full, &data->s->mutex);
+
+        if(data->s->q->size == 0 && data->s->readers_exited == data->s->readers_n) {
+            mutex_unlock(&data->s->mutex);
             break;
         }
-        data->s->written = true;
-        data->s->fetched = false;
-        /* Wake reader */
-        cond_signal(&data->s->write);
+        
+        if(data->s->q->size > 0) {
+            file_chunk *fc = queue_pop(data->s->q);
 
-        // Print loading percentage
-        if(data->filesize > 0) {
-            printf("\r%s... %d%%",(data->s->dflag) ? "Decrypting" : "Encrypting", (int)((sum*100)/data->filesize));
-            fflush(stdout); // Flush the output buffer
+            /* Wake readers */
+            cond_broadcast(&data->s->empty);
+
+            /* All readers exited. End of work. */
+            if(data->s->q->size == 0 && data->s->readers_exited == data->s->readers_n) {
+                end = true;
+            }
+
+            mutex_unlock(&data->s->mutex);
+
+            if(lseek(fd, fc->offset, SEEK_SET) == -1)
+                exit_with_sys_err("writer lseek");
+            if(fc->chunksize > 0) {
+                if(write(fd, fc->chunk, fc->chunksize) == -1)
+                    exit_with_sys_err("writer chunk");
+                sum += fc->chunksize;
+            }
+
+            free(fc->chunk);
+            free(fc);
+
+            /* Print loading percentage */
+            if(data->filesize > 0) {
+                printf("\r%s... %d%%",(data->s->dflag) ? "Decrypting" : "Encrypting", (int)((sum*100)/data->filesize));
+                fflush(stdout); // Flush the output buffer
+            }
         }
+        
+        if(end) break;    
     }
-    mutex_unlock(&data->s->mutex);
     close(fd);
     pthread_exit(NULL);
 }
@@ -552,7 +597,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if(free_mem < req_mem) {
+    if(free_mem < (req_mem*2)) {
         printf("Insufficient free memory. Close some applications and try again.\n");
         exit(EXIT_FAILURE);
     }
@@ -563,24 +608,22 @@ int main(int argc, char *argv[]) {
     printf("Using %ld CPU cores\n", cpu_cores_n);
     printf("Starting %u threads; %u readers, %u writer\n", readers_n+1, readers_n, 1);
 
+    /* Prepare queue for file chunks to process. */
+    queue_t q;
+    queue_init(&q, QUEUE_CAPACITY);
+
     /* Prepare shared data among threads. */
     shared_data shared;
-    shared.turn = 0;
-    shared.written = false;
-    shared.fetched = false;
     shared.dflag = dflag;
     shared.readers_exited = 0;
     shared.readers_n = readers_n;
-    shared.chunk = NULL;
-    shared.key = key;
-    shared.nonce = nonce;
+    shared.q = &q;
     if((err = pthread_mutex_init(&shared.mutex, NULL)) != 0)
         exit_with_err("pthread_mutex_init", err);
-    if((err = pthread_cond_init(&shared.write, NULL)) != 0)
+    if((err = pthread_cond_init(&shared.full, NULL)) != 0)
         exit_with_err("pthread_cond_init", err);
-    shared.readers = malloc(sizeof(pthread_cond_t) * readers_n);
-    for(uint16_t i = 0; i < readers_n; i++)
-        pthread_cond_init(&shared.readers[i], NULL);
+    if((err = pthread_cond_init(&shared.empty, NULL)) != 0)
+        exit_with_err("pthread_cond_init", err);
 
     /* Prepare readers threads data */
     reader_data readers[readers_n];
@@ -593,6 +636,8 @@ int main(int argc, char *argv[]) {
         readers[i].chunksize = chunksize;
         readers[i].chunksizeRem = chunksizeRem;
         readers[i].firstThreadRem = firstThreadRem;
+        readers[i].key = key;
+        readers[i].nonce = nonce;
         readers[i].s = &shared;
     }
     
@@ -629,20 +674,17 @@ int main(int argc, char *argv[]) {
     /* Destroy objects */
     if((err = pthread_mutex_destroy(&shared.mutex)) != 0)
         exit_with_err("pthread_mutex_destroy", err);
-    if((err = pthread_cond_destroy(&shared.write)) != 0)
+    if((err = pthread_cond_destroy(&shared.full)) != 0)
         exit_with_err("pthread_cond_destroy", err);
-    for(uint16_t i = 0; i < readers_n; i++) {
-        if((err = pthread_cond_destroy(&shared.readers[i])) != 0)
-            exit_with_err("pthread_cond_destroy", err); 
-    }
+    if((err = pthread_cond_destroy(&shared.empty)) != 0)
+        exit_with_err("pthread_cond_destroy", err);
 
     /* Free allocated memory */
     free(writer.filepath);
     for(uint16_t i = 0; i < readers_n; i++) {
         free(readers[i].filepath);
     }
-    free(shared.chunk);
-    free(shared.readers);
+    queue_destroy(&q);
     free(salt);
     free(key);
     free(nonce);
