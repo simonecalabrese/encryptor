@@ -604,8 +604,6 @@ int main(int argc, char *argv[]) {
         exit_with_err_msg("Insufficient free memory. Close some applications and try again."); 
 
     printf("File: %s (%lu bytes)... \n", argv[input_file_i], ifsize);
-    printf("File split in %u portions\n", portions_n);
-    printf("File Portion size %lu bytes \n", (ifsize > portion_max_size) ? portion_max_size: ifsize);
     printf("Using %ld CPU cores\n", cpu_cores_n);
     printf("Starting %u threads; %u readers, %u writer\n", readers_n+1, readers_n, 1);
 
