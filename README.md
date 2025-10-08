@@ -33,10 +33,10 @@ Every *reader* thread does the following operations:
 - performs chunk encryption/decryption;
 - pushes the processed chunk inside the file chunks queue.
 
-The writer extracts a file chunk from the queue and write it to the output file. 
+The *writer* extracts a file chunk from the queue and write it to the output file. 
 
 ### File processing
-The file is split in chunks, as many as the *readers*. Each chunk is currently at most 16MB, but to check how any remainders (from division) bytes are managed, check the code.
+The file is split in chunks, as many as the *readers*. Each chunk is currently at most 16MB, but to check how any remainders (from division) bytes are managed, check the code or the example below.
 
 If the file is too big, the file is at first split in portions and then split in chunks ensuring that the estimated maximum RAM required by the program will be: `(16MB * n_of_readers) + (16MB * queue_capacity) + other_small_quantities`.
 
@@ -62,7 +62,7 @@ This is an example you can find also in the code:
 ### Encryption/decryption
 In order to encrypt/decrypt files, the program derives a `key` and a `nonce` from user's `password` and `salt` using PBKDF2.
 
-Every file chunk encryption/decryption is totally isolated from others using OpenSSL's AES algorithm with CTR mode. For each chunk a new EVP context is initialized and an unique IV is generated using `nonce + chunk_index` (`nonce` and `key` are the same for all chunks). The *reader* thread encrypts/decrypts the chunk using the `key` and `iv` and frees the EVP context before moving on the next chunk. 
+Every file chunk encryption/decryption is totally isolated from others using OpenSSL's AES algorithm with CTR mode. For each chunk a new EVP context is initialized and an unique IV is generated using `nonce + chunk_index` (or counter), `nonce` and `key` are the same for all chunks. The *reader* thread encrypts/decrypts the chunk using the `key` and `iv` and frees the EVP context before moving on the next chunk. 
 
 
 ## Limitations
