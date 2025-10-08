@@ -577,7 +577,7 @@ int main(int argc, char *argv[]) {
         }
         /* File is made up by more than 1 portion. */
         else {
-            req_mem = portion_max_size;
+            req_mem = portion_max_size*2; /* consider also chunks inside queue */
 
             portions_n = (uint16_t)(ifsize / portion_max_size);
             chunksize = MAX_READER_CHUNK_SIZE;
@@ -600,7 +600,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if(free_mem < (req_mem*2))
+    if(free_mem < req_mem)
         exit_with_err_msg("Insufficient free memory. Close some applications and try again."); 
 
     printf("File: %s (%lu bytes)... \n", argv[input_file_i], ifsize);
