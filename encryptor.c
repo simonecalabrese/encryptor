@@ -43,7 +43,8 @@
 #define MAX_READER_CHUNK_SIZE 1024*1024*16
 /* Minimum file size to enable multithread execution. */
 #define MIN_FILE_SIZE (1024*16) + 1
-#define QUEUE_CAPACITY 10 /* queue capacity for file chunks. */
+#define MIN_PASSWORD_LEN 8
+#define QUEUE_CAPACITY 10
 #define SALT_LEN 16 /* required to derive the key from a password. */
 #define KEY_LEN 32 /* AES key fixed-length of 256 bit. */
 #define NONCE_LEN 12 /* base nonce length. */
@@ -463,11 +464,8 @@ void *writer_fn(void *arg) {
 }
 
 int main(int argc, char *argv[]) {
-    if(argc < 4) {
-        printf("run syntax error\n"
-        "correct usage: file-encryptor [-d] <file-input> <file-output> <strong_password> \n");
-        exit(EXIT_FAILURE);
-    }
+    if(argc < 4)
+        exit_with_err_msg("run syntax error\ncorrect usage: file-encryptor [-d] <file-input> <file-output> <strong_password> \n");
     int err;
     /* Start measuring execution time. */
     time_t start = time(NULL);
@@ -479,6 +477,11 @@ int main(int argc, char *argv[]) {
 
     uint8_t input_file_i = 1;
     if(dflag) input_file_i++; 
+
+    if(strlen(argv[input_file_i+2]) < MIN_PASSWORD_LEN) {
+        fprintf(stderr, "password must be at least %d characters\n", MIN_PASSWORD_LEN);
+        exit(EXIT_FAILURE);
+    }
 
     struct stat inputf; /* Input file stat */
     if((stat(argv[input_file_i], &inputf) == -1))
@@ -597,10 +600,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if(free_mem < (req_mem*2)) {
-        printf("Insufficient free memory. Close some applications and try again.\n");
-        exit(EXIT_FAILURE);
-    }
+    if(free_mem < (req_mem*2))
+        exit_with_err_msg("Insufficient free memory. Close some applications and try again."); 
 
     printf("File: %s (%lu bytes)... \n", argv[input_file_i], ifsize);
     printf("File split in %u portions\n", portions_n);
@@ -629,7 +630,7 @@ int main(int argc, char *argv[]) {
     reader_data readers[readers_n];
     for(uint16_t i = 0; i < readers_n; i++) {
         readers[i].id = i;
-        if((readers[i].filepath = malloc(sizeof(char)*strlen(argv[input_file_i]))) == NULL)
+        if((readers[i].filepath = malloc(sizeof(char)*(strlen(argv[input_file_i])+1))) == NULL)
             exit_with_sys_err("filepath malloc");
         strcpy(readers[i].filepath, argv[input_file_i]);
         readers[i].portions_n = portions_n;
@@ -650,7 +651,7 @@ int main(int argc, char *argv[]) {
     /* Prepare writer thread data. */
     writer_data writer;
     writer.filesize = ifsize;
-    if((writer.filepath = malloc(sizeof(char)*strlen(argv[input_file_i+1]))) == NULL)
+    if((writer.filepath = malloc(sizeof(char)*(strlen(argv[input_file_i+1])+1))) == NULL)
         exit_with_sys_err("writer filepath malloc");
     strcpy(writer.filepath, argv[input_file_i+1]);
     writer.s = &shared;
