@@ -1,7 +1,7 @@
 # Encryptor
 Encryptor is a fast multithreaded file encryption and decryption cli tool optimized for multi-core CPUs and minimal RAM usage.
 
-It uses OpenSSL's AES algorithm with CTR mode and chunked file reading so that only a small portion of the file is loaded into memory at a time, making it possible to encrypt very large files on systems with limited RAM.
+It uses OpenSSL's AES algorithm with CTR mode and chunked file processing so that only a small portion of the file is loaded into memory at a time, making it possible to encrypt very large files on systems with limited RAM.
 
 ## Installation
 - Make sure to have installed OpenSSL.
@@ -13,18 +13,18 @@ It uses OpenSSL's AES algorithm with CTR mode and chunked file reading so that o
 - Type `make` inside the project's root.
 
 ## Usage
-### Encrypt a file
+Encrypt a file:
 ```sh
 ./encryptor <file_to_encrypt> <encrypted_output> <strong_password>
 ```
-### Decrypt a file
+Decrypt a file:
 ```sh
 ./encryptor -d <encrypted_file> <decrypted_output> <strong_password>
 ```
 
 ## Implementation
 ### Multithreading
-The program performs chunked input reading, which works well on large files and keeps memory usage low and efficiency high.
+The program can read a fixed maximum amount of file chunks at a time, which works well to process large files and keeps memory usage low and efficiency high.
 
 It creates a number of *readers* threads that depends on the number of CPU processors currently online, in particular, it creates `cpu_active_cores - 1` *readers* threads reserving 1 core for the *writer* thread. 
 
