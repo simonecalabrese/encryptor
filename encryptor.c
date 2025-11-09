@@ -464,8 +464,6 @@ void *writer_fn(void *arg) {
 }
 
 int main(int argc, char *argv[]) {
-    if(argc < 4)
-        exit_with_err_msg("run syntax error\ncorrect usage: file-encryptor [-d] <file-input> <file-output> <strong_password> \n");
     int err;
     /* Start measuring execution time. */
     time_t start = time(NULL);
@@ -475,9 +473,22 @@ int main(int argc, char *argv[]) {
         dflag = true;
     }
 
+    /* Validate argv. */
+    bool args_err = false;
+    if(dflag) {
+        if(argc != 5)
+            args_err = true;
+    } else {
+        if(argc != 4)
+            args_err = true;
+    }
+    if(args_err)
+        exit_with_err_msg("run syntax error\ncorrect usage: file-encryptor [-d] <file-input> <file-output> <strong_password> \n");
+
     uint8_t input_file_i = 1;
     if(dflag) input_file_i++; 
 
+    /* Validate password. */
     if(strlen(argv[input_file_i+2]) < MIN_PASSWORD_LEN) {
         fprintf(stderr, "password must be at least %d characters\n", MIN_PASSWORD_LEN);
         exit(EXIT_FAILURE);
