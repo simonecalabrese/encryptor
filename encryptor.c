@@ -463,6 +463,17 @@ void *writer_fn(void *arg) {
     pthread_exit(NULL);
 }
 
+/* Format bytes into a human-readable string of length `n` (e.g. "1.00 MB" or "1.20 GB") */
+void bytes_format(long double bytes, char *out, int n) {
+    const char *units[] = {"bytes", "KB", "MB", "GB"};
+    int i = 0;
+    while (bytes >= 1024 && i < 3) {
+        bytes /= 1024;
+        i++;
+    }
+    snprintf(out, n, "%.2Lf %s", bytes, units[i]);
+}
+
 int main(int argc, char *argv[]) {
     int err;
     /* Start measuring execution time. */
@@ -617,7 +628,9 @@ int main(int argc, char *argv[]) {
     if(free_mem < req_mem)
         exit_with_err_msg("Insufficient free memory. Close some applications and try again."); 
 
-    printf("File: %s (%lu bytes)... \n", argv[input_file_i], ifsize);
+    char hfsize[12];
+    bytes_format(ifsize, hfsize, 12);
+    printf("File: %s (%s)... \n", argv[input_file_i], hfsize);
     printf("Using %ld CPU cores\n", cpu_cores_n);
     // printf("Starting %u threads; %u readers, %u writer\n", readers_n+1, readers_n, 1);
 
