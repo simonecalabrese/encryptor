@@ -172,8 +172,27 @@ test_1gb_file() {
     $ENCRYPTOR "$input" "$enc" "$PASSWORD"
     $ENCRYPTOR -d "$enc" "$dec" "$PASSWORD"
 
+    echo "Comparing files..."
     compare_files "$input" "$dec"
     echo "✅ Test 7 passed"
+}
+
+# Test 8: 10GB file
+test_10gb_file() {
+    echo "Running Test 8: 10GB file"
+    local input="$TMP_DIR/10gb.txt"
+    local enc="$TMP_DIR/10gb.enc"
+    local dec="$TMP_DIR/10gb.dec"
+
+    # Create file
+    create_file_with_size "$input" 10G
+
+    $ENCRYPTOR "$input" "$enc" "$PASSWORD"
+    $ENCRYPTOR -d "$enc" "$dec" "$PASSWORD"
+
+    echo "Comparing files..."
+    compare_files "$input" "$dec"
+    echo "✅ Test 8 passed"
 }
 
 # Clean tmp dir
@@ -191,6 +210,7 @@ test_1kb_file
 test_1mb_file
 sleep 1
 test_1gb_file
+test_10gb_file
 
 clean_up
 
