@@ -332,13 +332,13 @@ void *reader_fn(void *arg) {
         if((c = malloc(sizeof(unsigned char)*csize)) == NULL)
             exit_with_sys_err("reader chunk malloc");
         
-        uint64_t portionStart = (csize*data->s->readers_n*i);
+        uint64_t portionStart = (((uint64_t)(csize*data->s->readers_n))*i);
         if(i > 0) portionStart += (data->chunksizeRem*data->s->readers_n);
         uint64_t offset = (portionStart + (csize*data->id));
 
         if(data->id == 0 && i == portions_n-1) {
             /* Start of last portion where the remaining bytes must be written. */
-            offset = (data->chunksize*data->s->readers_n*data->portions_n)+(data->chunksizeRem*data->s->readers_n);
+            offset = (((uint64_t)(data->chunksize*data->s->readers_n))*data->portions_n)+(data->chunksizeRem*data->s->readers_n);
             csize = data->firstThreadRem;
         }
             
@@ -643,9 +643,9 @@ int main(int argc, char *argv[]) {
         readers[i].s = &shared;
     }
     
-    uint64_t total_bytes_to_process = ((chunksize*readers_n*(portions_n))+(chunksizeRem*readers_n)+firstThreadRem);
+    uint64_t total_bytes_to_process = (((uint64_t)(chunksize*readers_n))*portions_n)+(chunksizeRem*readers_n)+firstThreadRem;
     if(ifsize != total_bytes_to_process) {
-        printf("Total input file bytes (%ld) mismatch after initial chunk processing %lu\n", ifsize, total_bytes_to_process);
+        printf("error\nTotal input file bytes (%ld) mismatch after initial chunk processing %lu\n", ifsize, total_bytes_to_process);
         exit(EXIT_FAILURE);
     }
 
