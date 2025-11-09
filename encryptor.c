@@ -480,7 +480,7 @@ int main(int argc, char *argv[]) {
     time_t start = time(NULL);
 
     bool dflag = false; // Decrypt flag
-    if(strcmp(argv[1], "-d") == 0) {
+    if(argc > 1 && strcmp(argv[1], "-d") == 0) {
         dflag = true;
     }
 
