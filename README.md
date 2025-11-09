@@ -3,6 +3,8 @@ Encryptor is a fast multithreaded file encryption and decryption cli tool optimi
 
 It uses OpenSSL's AES algorithm with CTR mode and chunked file processing so that only a small portion of the file is loaded into memory at a time, making it possible to encrypt very large files on systems with limited RAM.
 
+![cli demo](cli_demo.gif)
+
 ## Installation
 - Make sure to have installed OpenSSL.
     ```sh
