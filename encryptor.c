@@ -39,7 +39,7 @@
 #include <openssl/rand.h>
 #include <time.h>
 
-/* Maximum file chunk size processable by . */
+/* Maximum file chunk size processable by a Reader thread. */
 #define MAX_READER_CHUNK_SIZE 1024*1024*16
 /* Minimum file size to enable multithread execution. */
 #define MIN_FILE_SIZE (1024*16) + 1
