@@ -487,10 +487,10 @@ int main(int argc, char *argv[]) {
     /* Validate argv. */
     bool args_err = false;
     if(dflag) {
-        if(argc != 5)
+        if(argc < 5)
             args_err = true;
     } else {
-        if(argc != 4)
+        if(argc < 4)
             args_err = true;
     }
     if(args_err)
@@ -554,6 +554,14 @@ int main(int argc, char *argv[]) {
     long cpu_cores_n = sysconf(_SC_NPROCESSORS_ONLN);
     if(cpu_cores_n == -1) 
         exit_with_sys_err("sysconf");
+    /* Set number of cores from args for testing. */
+    if((strstr(argv[argc-1], "CPU_CORES=")) != NULL) {
+        char test_cores_n[8];
+        strncpy(test_cores_n, strchr(argv[argc-1], '=')+1, 7);
+        test_cores_n[7] = 0;
+        int n = atoi(test_cores_n);
+        cpu_cores_n = n;
+    }
     if(cpu_cores_n <= 1)
         cpu_cores_n = 1;
     /* The number of reader threads will be cpu_cores_n - 1 (or 1) so that

@@ -59,7 +59,7 @@ create_file_with_size() {
 
 
 
-# Test 1: Simple text file
+# Test 1: Simple text file.
 test_simple_text_file() {
     echo "Running Test 1: Simple text file"
     local input="$TMP_DIR/simple.txt"
@@ -75,7 +75,7 @@ test_simple_text_file() {
     echo "✅ Test 1 passed"
 }
 
-# Test 2: Empty file
+# Test 2: Empty file.
 test_empty_file() {
     echo "Running Test 2: Empty file"
     local input="$TMP_DIR/empty.txt"
@@ -91,7 +91,7 @@ test_empty_file() {
     echo "✅ Test 2 passed"
 }
 
-# Test 3: File with all byte values
+# Test 3: File with all byte values.
 test_all_bytes_file() {
     echo "Running Test 3: All-byte file"
     local input="$TMP_DIR/all_bytes.bin"
@@ -110,7 +110,7 @@ test_all_bytes_file() {
     echo "✅ Test 3 passed"
 }
 
-# Test 4: 1B file
+# Test 4: 1B file.
 test_1b_file() {
     echo "Running Test 4: 1B file"
     local input="$TMP_DIR/1b.txt"
@@ -126,7 +126,7 @@ test_1b_file() {
     echo "✅ Test 4 passed"
 }
 
-# Test 5: 1KB file
+# Test 5: 1KB file.
 test_1kb_file() {
     echo "Running Test 5: 1KB file"
     local input="$TMP_DIR/1kb.txt"
@@ -142,7 +142,7 @@ test_1kb_file() {
     echo "✅ Test 5 passed"
 }
 
-# Test 6: 1MB file
+# Test 6: 1MB file.
 test_1mb_file() {
     echo "Running Test 6: 1MB file"
     local input="$TMP_DIR/1mb.txt"
@@ -159,7 +159,7 @@ test_1mb_file() {
     echo "✅ Test 6 passed"
 }
 
-# Test 7: 1GB file
+# Test 7: 1GB file.
 test_1gb_file() {
     echo "Running Test 7: 1GB file"
     local input="$TMP_DIR/1gb.txt"
@@ -177,7 +177,7 @@ test_1gb_file() {
     echo "✅ Test 7 passed"
 }
 
-# Test 8: 10GB file
+# Test 8: 10GB file.
 test_10gb_file() {
     echo "Running Test 8: 10GB file"
     local input="$TMP_DIR/10gb.txt"
@@ -193,6 +193,96 @@ test_10gb_file() {
     echo "Comparing files..."
     compare_files "$input" "$dec"
     echo "✅ Test 8 passed"
+}
+
+# Test 9: 64MB file and 1 core.
+test_1core() {
+    echo "Running Test 9: Using 1 core; 64MB file"
+    local input="$TMP_DIR/64mb.txt"
+    local enc="$TMP_DIR/64mb.enc"
+    local dec="$TMP_DIR/64mb.dec"
+
+    # Create file
+    create_file_with_size "$input" 64M
+
+    $ENCRYPTOR "$input" "$enc" "$PASSWORD" CPU_CORES=1
+    $ENCRYPTOR -d "$enc" "$dec" "$PASSWORD" CPU_CORES=1
+
+    echo "Comparing files..."
+    compare_files "$input" "$dec"
+    echo "✅ Test 9 passed"
+}
+
+# Test 10: 64MB file and 2 core.
+test_2core() {
+    echo "Running Test 10: Using 2 core; 64MB file"
+    local input="$TMP_DIR/64mb.txt"
+    local enc="$TMP_DIR/64mb.enc"
+    local dec="$TMP_DIR/64mb.dec"
+
+    # Create file
+    create_file_with_size "$input" 64M
+
+    $ENCRYPTOR "$input" "$enc" "$PASSWORD" CPU_CORES=2
+    $ENCRYPTOR -d "$enc" "$dec" "$PASSWORD" CPU_CORES=2
+
+    echo "Comparing files..."
+    compare_files "$input" "$dec"
+    echo "✅ Test 10 passed"
+}
+
+# Test 11: 64MB file and 4 core.
+test_4core() {
+    echo "Running Test 11: Using 4 core; 64MB file"
+    local input="$TMP_DIR/64mb.txt"
+    local enc="$TMP_DIR/64mb.enc"
+    local dec="$TMP_DIR/64mb.dec"
+
+    # Create file
+    create_file_with_size "$input" 64M
+
+    $ENCRYPTOR "$input" "$enc" "$PASSWORD" CPU_CORES=4
+    $ENCRYPTOR -d "$enc" "$dec" "$PASSWORD" CPU_CORES=4
+
+    echo "Comparing files..."
+    compare_files "$input" "$dec"
+    echo "✅ Test 11 passed"
+}
+
+# Test 12: 64MB file and 8 core.
+test_8core() {
+    echo "Running Test 12: Using 8 core; 64MB file"
+    local input="$TMP_DIR/64mb.txt"
+    local enc="$TMP_DIR/64mb.enc"
+    local dec="$TMP_DIR/64mb.dec"
+
+    # Create file
+    create_file_with_size "$input" 64M
+
+    $ENCRYPTOR "$input" "$enc" "$PASSWORD" CPU_CORES=8
+    $ENCRYPTOR -d "$enc" "$dec" "$PASSWORD" CPU_CORES=8
+
+    echo "Comparing files..."
+    compare_files "$input" "$dec"
+    echo "✅ Test 12 passed"
+}
+
+# Test 13: 64MB file and 12 core.
+test_12core() {
+    echo "Running Test 13: Using 12 core; 64MB file"
+    local input="$TMP_DIR/64mb.txt"
+    local enc="$TMP_DIR/64mb.enc"
+    local dec="$TMP_DIR/64mb.dec"
+
+    # Create file
+    create_file_with_size "$input" 64M
+
+    $ENCRYPTOR "$input" "$enc" "$PASSWORD" CPU_CORES=12
+    $ENCRYPTOR -d "$enc" "$dec" "$PASSWORD" CPU_CORES=12
+
+    echo "Comparing files..."
+    compare_files "$input" "$dec"
+    echo "✅ Test 13 passed"
 }
 
 # Clean tmp dir
@@ -211,6 +301,12 @@ test_1mb_file
 sleep 1
 test_1gb_file
 test_10gb_file
+sleep 1
+test_1core
+test_2core
+test_4core
+test_8core
+test_12core
 
 clean_up
 
